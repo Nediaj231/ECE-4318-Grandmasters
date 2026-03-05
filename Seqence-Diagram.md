@@ -57,6 +57,9 @@ MoveGen -->> Engine: returns legalMoves list
 deactivate MoveGen
 Engine ->> Engine: choose first move (legalMoves.get(0))
 Engine ->> MoveObj: selectedMove.toUci()
+activate MoveObj
+MoveObj -->> Engine: Return bestmove from algorithm
+deactivate MoveObj
 Engine -->> Host: "bestmove e2e4"
 deactivate Engine
 
