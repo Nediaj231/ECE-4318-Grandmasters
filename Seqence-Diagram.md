@@ -48,6 +48,11 @@ activate Engine
 Engine ->> Parser: parse "go" options (movetime/wtime/etc.)
 Engine ->> MoveGen: legalMoves = Position.legalMoves()
 activate MoveGen
+MoveGen ->> Rule: Pieces legalMoves
+MoveGen ->> Rule: Check isSquaredAttacked / inCheck
+activate Rule
+Rule -->> MoveGen: Approve legalMove
+deactivate Rule
 MoveGen -->> Engine: returns legalMoves list
 deactivate MoveGen
 Engine ->> Engine: choose first move (legalMoves.get(0))
