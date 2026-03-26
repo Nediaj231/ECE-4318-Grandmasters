@@ -5,6 +5,7 @@
 
 // Minimal UCI engine: first legal move.
 // No castling, no en-passant; promotions -> queen only.
+//has included caslting
 
 typedef struct {
     int from, to;
@@ -14,6 +15,12 @@ typedef struct {
 typedef struct {
     char b[64];
     int white_to_move;
+//castle
+    int castle_wk;
+    int castle_wq;
+    int castle_bk;
+    int castle_bq;
+
 } Pos;
 
 static int sq_index(const char *s) {
@@ -31,6 +38,11 @@ static void index_to_sq(int idx, char out[3]) {
 static void pos_from_fen(Pos *p, const char *fen) {
     memset(p->b, '.', 64);
     p->white_to_move = 1;
+//castling white side and black side
+    p->castle_wk = 0;
+    p->castle_wq = 0;
+    p->castle_bk = 0;
+    p->castle_bq = 0;
 
     char buf[256];
     strncpy(buf, fen, sizeof(buf)-1);
@@ -39,8 +51,18 @@ static void pos_from_fen(Pos *p, const char *fen) {
     char *save = NULL;
     char *placement = strtok_r(buf, " ", &save);
     char *stm = strtok_r(NULL, " ", &save);
-    if (stm) p->white_to_move = (strcmp(stm, "w") == 0);
 
+    char *castling = strtok_r(NULL, " ", &save);
+
+    if (stm) p->white_to_move = (strcmp(stm, "w") == 0);
+//casltiing
+    if (castling) {
+        p->castle_wk = (strchr(castling, 'K') != NULL);
+        p->castle_wq = (strchr(castling, 'Q') != NULL);
+        p->castle_bk = (strchr(castling, 'k') != NULL);
+        p->castle_bq = (strchr(castling, 'q') != NULL);
+    }
+    
     int rank = 7, file = 0;
     for (size_t i = 0; placement && placement[i]; i++) {
         char c = placement[i];
@@ -316,6 +338,29 @@ static void gen_king(const Pos *p, int from, int white, Move *moves, int *n) {
             add_move(moves, n, from, to, 0);
             }
 
+        }
+    }
+if (white && from == 4 && p->b[4] == 'K' && !in_check(p, 1)) {
+        if (p->castle_wk &&
+            p->b[5] == '.' && p->b[6] == '.' && p->b[7] == 'R' &&
+            !is_square_attacked(p, 5, 0) && !is_square_attacked(p, 6, 0)) {
+            add_move(moves, n, from, 6, 0);
+        }
+        if (p->castle_wq &&
+            p->b[1] == '.' && p->b[2] == '.' && p->b[3] == '.' && p->b[0] == 'R' &&
+            !is_square_attacked(p, 3, 0) && !is_square_attacked(p, 2, 0)) {
+            add_move(moves, n, from, 2, 0);
+        }
+    } else if (!white && from == 60 && p->b[60] == 'k' && !in_check(p, 0)) {
+        if (p->castle_bk &&
+            p->b[61] == '.' && p->b[62] == '.' && p->b[63] == 'r' &&
+            !is_square_attacked(p, 61, 1) && !is_square_attacked(p, 62, 1)) {
+            add_move(moves, n, from, 62, 0);
+        }
+        if (p->castle_bq &&
+            p->b[57] == '.' && p->b[58] == '.' && p->b[59] == '.' && p->b[56] == 'r' &&
+            !is_square_attacked(p, 59, 1) && !is_square_attacked(p, 58, 1)) {
+            add_move(moves, n, from, 58, 0);
         }
     }
 }
