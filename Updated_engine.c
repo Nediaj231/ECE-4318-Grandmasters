@@ -591,10 +591,10 @@ static int evaluate(const Pos *p) {
 static int piece_value_for_ordering(char pc) {
     switch (toupper((unsigned char)pc)) {
         case 'P': return 100;
-        case 'N': return 300;
-        case 'B': return 300;
-        case 'R': return 500;
-        case 'Q': return 900;
+        case 'N': return 350;
+        case 'B': return 350;
+        case 'R': return 525;
+        case 'Q': return 1000;
         case 'K': return 10000;
         default:  return 0;
     }
