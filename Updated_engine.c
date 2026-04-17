@@ -587,14 +587,14 @@ static void apply_uci_move(Pos *p, const char *uci) {
 static void parse_position(Pos *p, const char *line) {
     // position startpos [moves ...]
     // position fen <6 fields> [moves ...]
-    char buf[1024];
+    char buf[8192];
     strncpy(buf, line, sizeof(buf)-1);
     buf[sizeof(buf) - 1] = 0;
 
-    char *toks[128];
+    char *toks[1024];
     int nt = 0;
     char *save = NULL;
-    for (char *tok = strtok_r(buf, " \t\r\n", &save); tok && nt < 128; tok = strtok_r(NULL, " \t\r\n", &save)) {
+    for (char *tok = strtok_r(buf, " \t\r\n", &save); tok && nt < 1024; tok = strtok_r(NULL, " \t\r\n", &save)) {
         toks[nt++] = tok;
     }
 
@@ -1055,7 +1055,7 @@ int main(void) {
     Pos pos;
     pos_start(&pos);
 
-    char line[1024];
+    char line[8192];
     while (fgets(line, sizeof(line), stdin)) {
         // trim
         size_t len = strlen(line);
