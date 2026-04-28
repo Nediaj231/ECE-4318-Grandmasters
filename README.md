@@ -1,6 +1,6 @@
 # ECE-4318-codes
 
-Team 1 Chess Grandmasters
+Team 1 Chess Grandmasters  
 Language: C
 
 Members: Jaiden, Jan, Cole, Charlie, Yen
