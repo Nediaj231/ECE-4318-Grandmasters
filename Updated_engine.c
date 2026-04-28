@@ -2,10 +2,139 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
-// Minimal UCI engine: first legal move.
-// No castling, no en-passant; promotions -> queen only.
-//has included caslting
+#define ENGINE_VERSION "v2.1.0"
+
+// ============================================================
+// REPETITION DETECTION
+// ============================================================
+// Simple position hash for repetition tracking.
+// We store a lightweight hash of each position played.
+static unsigned long long g_pos_hashes[1024]; // hash of each position in game
+static int g_pos_hash_count = 0;
+
+// Quick hash of a board position (not Zobrist, but sufficient for repetition)
+static unsigned long long compute_pos_hash(const char board[64], int wtm, int castle_bits) {
+    unsigned long long h = (unsigned long long)wtm;
+    h = h * 1099511628211ULL + (unsigned char)castle_bits;
+    for (int i = 0; i < 64; i++) {
+        h = h * 1099511628211ULL + (unsigned char)board[i];
+    }
+    return h;
+}
+
+// Check if a position hash has been seen 'threshold' times in game history
+static int is_repetition(unsigned long long hash, int threshold) {
+    int count = 0;
+    for (int i = 0; i < g_pos_hash_count; i++) {
+        if (g_pos_hashes[i] == hash) {
+            count++;
+            if (count >= threshold) return 1;
+        }
+    }
+    return 0;
+}
+
+// ============================================================
+// OPENING BOOK
+// ============================================================
+// Move history tracking for book lookups
+static char g_move_history[512][6]; // UCI moves played so far
+static int  g_move_count = 0;
+
+typedef struct { const char *line; const char *reply; } BookEntry;
+
+// 24 opening lines covering major chess openings.
+// "line" = space-separated UCI moves already played.
+// "reply" = the book move to play next.
+static const BookEntry OPENING_BOOK[] = {
+    // ── White first moves (randomly selected!) ──
+    {"",                                        "e2e4"},  // 1. e4 (King's Pawn)
+    {"",                                        "d2d4"},  // 1. d4 (Queen's Pawn)
+    {"",                                        "g1f3"},  // 1. Nf3 (Réti Opening)
+
+    // ── Italian Game: 1.e4 e5 2.Nf3 Nc6 3.Bc4 ──
+    {"e2e4 e7e5",                                "g1f3"},  // 2. Nf3
+    {"e2e4 e7e5 g1f3 b8c6",                      "f1c4"},  // 3. Bc4 (Italian)
+    {"e2e4 e7e5 g1f3 b8c6 f1c4 f8c5",            "c2c3"},  // 4. c3 (Giuoco Piano)
+    {"e2e4 e7e5 g1f3 b8c6 f1c4 g8f6",            "d2d3"},  // 4. d3 (Giuoco Pianissimo)
+
+    // ── Ruy Lopez: 1.e4 e5 2.Nf3 Nc6 3.Bb5 ──
+    {"e2e4 e7e5 g1f3 b8c6",                      "f1b5"},  // 3. Bb5 (Ruy Lopez alternative)
+    {"e2e4 e7e5 g1f3 b8c6 f1b5 a7a6",            "b5a4"},  // 4. Ba4
+
+    // ── Sicilian Defense: 1.e4 c5 ──
+    {"e2e4 c7c5",                                "g1f3"},  // 2. Nf3 (Open Sicilian)
+    {"e2e4 c7c5 g1f3 d7d6",                      "d2d4"},  // 3. d4
+    {"e2e4 c7c5 g1f3 b8c6",                      "d2d4"},  // 3. d4
+    {"e2e4 c7c5 g1f3 e7e6",                      "d2d4"},  // 3. d4
+
+    // ── French Defense: 1.e4 e6 ──
+    {"e2e4 e7e6",                                "d2d4"},  // 2. d4
+    {"e2e4 e7e6 d2d4 d7d5",                      "b1c3"},  // 3. Nc3 (Classical)
+
+    // ── Caro-Kann: 1.e4 c6 ──
+    {"e2e4 c7c6",                                "d2d4"},  // 2. d4
+    {"e2e4 c7c6 d2d4 d7d5",                      "b1c3"},  // 3. Nc3
+
+    // ── Scandinavian: 1.e4 d5 ──
+    {"e2e4 d7d5",                                "e4d5"},  // 2. exd5
+
+    // ── Black responses to 1.e4 (randomly selected!) ──
+    {"e2e4",                                     "e7e5"},  // 1...e5 (classical)
+    {"e2e4",                                     "c7c5"},  // 1...c5 (Sicilian)
+    {"e2e4",                                     "e7e6"},  // 1...e6 (French)
+    {"e2e4 e7e5 g1f3",                           "b8c6"},  // 2...Nc6
+    {"e2e4 e7e5 g1f3 b8c6 f1b5",                 "a7a6"},  // 3...a6 (Morphy Defense)
+    {"e2e4 e7e5 g1f3 b8c6 f1c4",                 "f8c5"},  // 3...Bc5
+
+    // ── Queen's Gambit: 1.d4 d5 2.c4 ──
+    {"d2d4 d7d5",                                "c2c4"},  // 2. c4 (Queen's Gambit)
+    {"d2d4 d7d5 c2c4 e7e6",                      "b1c3"},  // 3. Nc3 (QGD)
+
+    // ── London System: 1.d4 Nf6 2.Bf4 ──
+    {"d2d4 g8f6",                                "c1f4"},  // 2. Bf4 (London)
+    {"d2d4 g8f6",                                "c2c4"},  // 2. c4 (alternative)
+
+    // ── Black responses to 1.d4 (randomly selected!) ──
+    {"d2d4",                                     "d7d5"},  // 1...d5
+    {"d2d4",                                     "g8f6"},  // 1...Nf6 (Indian Defense)
+    {"d2d4 d7d5 c2c4",                           "e7e6"},  // 2...e6 (QGD)
+    {"d2d4 d7d5 c2c4",                           "c7c6"},  // 2...c6 (Slav Defense)
+
+    // ── Réti / English responses ──
+    {"g1f3",                                     "d7d5"},  // 1...d5
+    {"g1f3",                                     "g8f6"},  // 1...Nf6
+    {"c2c4",                                     "e7e5"},  // 1...e5
+    {"c2c4",                                     "g8f6"},  // 1...Nf6
+};
+#define BOOK_SIZE (sizeof(OPENING_BOOK) / sizeof(OPENING_BOOK[0]))
+
+// Build history string and look up in book. Returns 1 if found.
+// If multiple book moves exist for the same position, picks randomly.
+static int book_lookup(char *out_move) {
+    // Build current history string
+    char history[2048] = "";
+    for (int i = 0; i < g_move_count; i++) {
+        if (i > 0) strcat(history, " ");
+        strcat(history, g_move_history[i]);
+    }
+    // Collect all matching entries
+    const char *candidates[16];
+    int num_candidates = 0;
+    for (int i = 0; i < (int)BOOK_SIZE; i++) {
+        if (strcmp(history, OPENING_BOOK[i].line) == 0) {
+            if (num_candidates < 16)
+                candidates[num_candidates++] = OPENING_BOOK[i].reply;
+        }
+    }
+    if (num_candidates == 0) return 0;
+    // Pick randomly among matches
+    int choice = rand() % num_candidates;
+    strcpy(out_move, candidates[choice]);
+    return 1;
+}
 
 typedef struct {
     int from, to;
@@ -49,10 +178,10 @@ static void pos_from_fen(Pos *p, const char *fen) {
     buf[sizeof(buf) - 1] = 0;
 
     //char *save = NULL;
-    char *placement = strtok_r(buf, " ");
-    char *stm = strtok_r(NULL, " ");
+    char *placement = strtok(buf, " ");
+    char *stm = strtok(NULL, " ");
 
-    char *castling = strtok_r(NULL, " ");
+    char *castling = strtok(NULL, " ");
 
     if (stm) p->white_to_move = (strcmp(stm, "w") == 0);
 //casltiing
@@ -172,6 +301,7 @@ static int in_check(const Pos *p, int white_king) {
 
 static Pos make_move(const Pos *p, Move m) {
     Pos np = *p;
+    char captured = p->b[m.to];
     char piece = np.b[m.from];
     np.b[m.from] = '.';
     char placed = piece;
@@ -240,13 +370,12 @@ static void gen_pawn(const Pos *p, int from, int white, Move *moves, int *n) {
     int promo_r = white ? 7 : 0;
 
     int onesq = (r + dir) * 8 + f;
-    int twosq = (r + 2 * dir) * 8 + f;
 
     char promos[4] = {'q', 'r', 'b', 'n'};
 
     // Moving forward
     if (r + dir >= 0 && r + dir < 8 && p->b[onesq] == '.') {
-        if (r == promo_r)
+        if (r + dir == promo_r)
             for (int i = 0; i < 4; i++){
                 add_move(moves, n, from, onesq, promos[i]);
             }
@@ -270,9 +399,9 @@ static void gen_pawn(const Pos *p, int from, int white, Move *moves, int *n) {
         int to = cr * 8 + cf;
         char target = p->b[to];
         if (target != '.' && is_white_piece(target) != white) {
-            if (r == promo_r)
+            if (cr == promo_r)
                 for (int i = 0; i < 4; i++){
-                add_move(moves, n, from, onesq, promos[i]);
+                add_move(moves, n, from, to, promos[i]);
             }
             else    
                 add_move(moves, n, from, to, 0);
@@ -458,18 +587,20 @@ static void apply_uci_move(Pos *p, const char *uci) {
 static void parse_position(Pos *p, const char *line) {
     // position startpos [moves ...]
     // position fen <6 fields> [moves ...]
-    char buf[1024];
+    char buf[8192];
     strncpy(buf, line, sizeof(buf)-1);
     buf[sizeof(buf) - 1] = 0;
 
-    char *toks[128];
+    char *toks[1024];
     int nt = 0;
     char *save = NULL;
-    for (char *tok = strtok_r(buf, " \t\r\n", &save); tok && nt < 128; tok = strtok_r(NULL, " \t\r\n", &save)) {
+    for (char *tok = strtok_r(buf, " \t\r\n", &save); tok && nt < 1024; tok = strtok_r(NULL, " \t\r\n", &save)) {
         toks[nt++] = tok;
     }
 
     int i = 1;
+    g_move_count = 0; // Reset move history
+    g_pos_hash_count = 0; // Reset position hashes for repetition detection
     if (i < nt && strcmp(toks[i], "startpos") == 0) {
         pos_start(p);
         i++;
@@ -486,7 +617,20 @@ static void parse_position(Pos *p, const char *line) {
 
     if (i < nt && strcmp(toks[i], "moves") == 0) {
         i++;
-        for (; i < nt; i++) apply_uci_move(p, toks[i]);
+        for (; i < nt; i++) {
+            // Record move in history for opening book
+            if (g_move_count < 512) {
+                strncpy(g_move_history[g_move_count], toks[i], 5);
+                g_move_history[g_move_count][5] = 0;
+                g_move_count++;
+            }
+            apply_uci_move(p, toks[i]);
+            // Track all positions for repetition detection
+            if (g_pos_hash_count < 1024) {
+                g_pos_hashes[g_pos_hash_count++] = compute_pos_hash(p->b, p->white_to_move,
+                    p->castle_wk | (p->castle_wq << 1) | (p->castle_bk << 2) | (p->castle_bq << 3));
+            }
+        }
     }
 }
 
@@ -499,11 +643,428 @@ static void print_bestmove(Move m) {
     fflush(stdout);
 }
 
+// Standard relative piece values for material evaluation
+#define PAWN_VALUE 100
+#define KNIGHT_VALUE 300
+#define BISHOP_VALUE 300
+#define ROOK_VALUE 500
+#define QUEEN_VALUE 900
+#define KING_VALUE 10000 // Arbitrarily high value for the King
+
+static const int PAWN_PST[64] = {
+     0,  0,  0,  0,  0,  0,  0,  0,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5,  5, 10, 25, 25, 10,  5,  5,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    50, 50, 50, 50, 50, 50, 50, 50,
+     0,  0,  0,  0,  0,  0,  0,  0
+};
+
+static const int KNIGHT_PST[64] = {
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50
+};
+
+static const int GENERAL_PST[64] = {
+    -20,-10,-10,-10,-10,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0,  5, 10, 10,  5,  0,-10,
+    -10,  5, 10, 20, 20, 10,  5,-10,
+    -10,  5, 10, 20, 20, 10,  5,-10,
+    -10,  0,  5, 10, 10,  5,  0,-10,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -20,-10,-10,-10,-10,-10,-10,-20
+};
+
+/**
+ * Enhanced evaluation: material + PST + pawn structure + bishop pair +
+ * rook on open file + king safety.
+ */
+static int evaluate(const Pos *p) {
+    int score = 0;
+    int white_bishops = 0, black_bishops = 0;
+    int white_pawns_on_file[8] = {0}, black_pawns_on_file[8] = {0};
+    int white_pawn_present[8] = {0}, black_pawn_present[8] = {0};
+    int wk_sq = -1, bk_sq = -1;
+
+    // First pass: material + PST + count pieces
+    for (int sq = 0; sq < 64; sq++) {
+        char piece = p->b[sq];
+        if (piece == '.') continue;
+        int is_white = is_white_piece(piece);
+        char up = (char)toupper((unsigned char)piece);
+        int pst_idx = is_white ? sq : (56 - (sq / 8) * 8 + (sq % 8));
+        int val = 0, pst = 0;
+        int file = sq % 8;
+
+        if (up == 'P') {
+            val = PAWN_VALUE; pst = PAWN_PST[pst_idx];
+            if (is_white) { white_pawns_on_file[file]++; white_pawn_present[file] = 1; }
+            else          { black_pawns_on_file[file]++; black_pawn_present[file] = 1; }
+        }
+        else if (up == 'N') { val = KNIGHT_VALUE; pst = KNIGHT_PST[pst_idx]; }
+        else if (up == 'B') {
+            val = BISHOP_VALUE; pst = GENERAL_PST[pst_idx];
+            if (is_white) white_bishops++; else black_bishops++;
+        }
+        else if (up == 'R') { val = ROOK_VALUE; pst = GENERAL_PST[pst_idx] / 2; }
+        else if (up == 'Q') { val = QUEEN_VALUE; pst = GENERAL_PST[pst_idx]; }
+        else if (up == 'K') {
+            val = KING_VALUE; pst = -GENERAL_PST[pst_idx];
+            if (is_white) wk_sq = sq; else bk_sq = sq;
+        }
+
+        if (is_white) score += val + pst;
+        else          score -= (val + pst);
+    }
+
+    // Bishop pair bonus
+    if (white_bishops >= 2) score += 50;
+    if (black_bishops >= 2) score -= 50;
+
+    // Pawn structure
+    for (int f = 0; f < 8; f++) {
+        // Doubled pawns penalty
+        if (white_pawns_on_file[f] > 1) score -= 20 * (white_pawns_on_file[f] - 1);
+        if (black_pawns_on_file[f] > 1) score += 20 * (black_pawns_on_file[f] - 1);
+        // Isolated pawns penalty
+        int wn = (f > 0 ? white_pawn_present[f-1] : 0) + (f < 7 ? white_pawn_present[f+1] : 0);
+        int bn = (f > 0 ? black_pawn_present[f-1] : 0) + (f < 7 ? black_pawn_present[f+1] : 0);
+        if (white_pawn_present[f] && wn == 0) score -= 15;
+        if (black_pawn_present[f] && bn == 0) score += 15;
+    }
+
+    // Rook on open/semi-open file
+    for (int sq = 0; sq < 64; sq++) {
+        char pc = p->b[sq];
+        if (pc == 'R' || pc == 'r') {
+            int f = sq % 8;
+            int is_w = (pc == 'R');
+            int own_pawns = is_w ? white_pawns_on_file[f] : black_pawns_on_file[f];
+            int opp_pawns = is_w ? black_pawns_on_file[f] : white_pawns_on_file[f];
+            int bonus = 0;
+            if (own_pawns == 0 && opp_pawns == 0) bonus = 25; // open file
+            else if (own_pawns == 0) bonus = 15; // semi-open
+            if (is_w) score += bonus; else score -= bonus;
+        }
+    }
+
+    // King safety: bonus for pawn shield
+    if (wk_sq >= 0) {
+        int kf = wk_sq % 8, kr = wk_sq / 8;
+        int shield = 0;
+        for (int df = -1; df <= 1; df++) {
+            int sf = kf + df;
+            if (sf < 0 || sf > 7) continue;
+            if (kr + 1 < 8 && p->b[(kr+1)*8+sf] == 'P') shield++;
+        }
+        score += shield * 10;
+    }
+    if (bk_sq >= 0) {
+        int kf = bk_sq % 8, kr = bk_sq / 8;
+        int shield = 0;
+        for (int df = -1; df <= 1; df++) {
+            int sf = kf + df;
+            if (sf < 0 || sf > 7) continue;
+            if (kr - 1 >= 0 && p->b[(kr-1)*8+sf] == 'p') shield++;
+        }
+        score -= shield * 10;
+    }
+
+    return score;
+}
+
+// Generate only legal captures and promotions (for quiescence search)
+static int legal_captures(const Pos *p, Move *out) {
+    Move tmp[256];
+    int pn = pseudo_legal_moves(p, tmp);
+    int n = 0;
+    for (int i = 0; i < pn; i++) {
+        if (p->b[tmp[i].to] == '.' && !tmp[i].promo) continue; // skip quiet moves
+        Pos np = make_move(p, tmp[i]);
+        if (!in_check(&np, !np.white_to_move)) {
+            out[n++] = tmp[i];
+        }
+    }
+    return n;
+}
+
+// ============================================================
+// SEARCH ENGINE v2.0
+// ============================================================
+#define MAX_DEPTH 64
+#define DEFAULT_DEPTH 7
+#define MATE_SCORE 100000
+#define INF_SCORE 999999
+#define NULL_MOVE_R 2
+
+// Killer moves: 2 per ply
+static Move killers[MAX_DEPTH][2];
+
+// History heuristic table [from][to]
+static int history_table[64][64];
+
+static int piece_value_for_ordering(char pc) {
+    switch (toupper((unsigned char)pc)) {
+        case 'P': return 100;  case 'N': return 300;
+        case 'B': return 300;  case 'R': return 500;
+        case 'Q': return 900;  case 'K': return 10000;
+        default:  return 0;
+    }
+}
+
+static int is_killer(Move m, int ply) {
+    return (killers[ply][0].from == m.from && killers[ply][0].to == m.to) ||
+           (killers[ply][1].from == m.from && killers[ply][1].to == m.to);
+}
+
+static void store_killer(Move m, int ply) {
+    if (killers[ply][0].from != m.from || killers[ply][0].to != m.to) {
+        killers[ply][1] = killers[ply][0];
+        killers[ply][0] = m;
+    }
+}
+
+static void order_moves(const Pos *p, Move *moves, int n, int ply) {
+    int scores[256];
+    for (int i = 0; i < n; i++) {
+        char victim = p->b[moves[i].to];
+        if (victim != '.') {
+            scores[i] = 20000 + piece_value_for_ordering(victim) * 10
+                        - piece_value_for_ordering(p->b[moves[i].from]);
+        } else if (is_killer(moves[i], ply)) {
+            scores[i] = 9000;
+        } else {
+            scores[i] = history_table[moves[i].from][moves[i].to];
+        }
+        if (moves[i].promo) scores[i] += 19000;
+    }
+    for (int i = 1; i < n; i++) {
+        Move km = moves[i]; int ks = scores[i]; int j = i - 1;
+        while (j >= 0 && scores[j] < ks) {
+            moves[j+1] = moves[j]; scores[j+1] = scores[j]; j--;
+        }
+        moves[j+1] = km; scores[j+1] = ks;
+    }
+}
+
+/**
+ * Quiescence Search: extends search at leaf nodes by evaluating
+ * all captures until the position is "quiet". Eliminates the
+ * horizon effect (e.g. not seeing a recapture).
+ */
+static int quiescence(Pos *p, int alpha, int beta) {
+    int stand_pat = evaluate(p);
+    int maximizing = p->white_to_move;
+
+    if (maximizing) {
+        if (stand_pat >= beta) return beta;
+        if (stand_pat > alpha) alpha = stand_pat;
+        Move caps[256];
+        int n = legal_captures(p, caps);
+        order_moves(p, caps, n, 0);
+        for (int i = 0; i < n; i++) {
+            Pos next = make_move(p, caps[i]);
+            int score = quiescence(&next, alpha, beta);
+            if (score > alpha) alpha = score;
+            if (alpha >= beta) return beta;
+        }
+        return alpha;
+    } else {
+        if (stand_pat <= alpha) return alpha;
+        if (stand_pat < beta) beta = stand_pat;
+        Move caps[256];
+        int n = legal_captures(p, caps);
+        order_moves(p, caps, n, 0);
+        for (int i = 0; i < n; i++) {
+            Pos next = make_move(p, caps[i]);
+            int score = quiescence(&next, alpha, beta);
+            if (score < beta) beta = score;
+            if (alpha >= beta) return alpha;
+        }
+        return beta;
+    }
+}
+
+/**
+ * Alpha-Beta with Null Move Pruning, Killer Moves, LMR, and
+ * Quiescence Search at leaf nodes.
+ */
+static int alpha_beta(Pos *p, int depth, int alpha, int beta,
+                      int ply, int do_null) {
+    if (depth <= 0) return quiescence(p, alpha, beta);
+
+    int maximizing = p->white_to_move;
+
+    // Repetition detection inside search: treat repeated positions as draws
+    unsigned long long ph = compute_pos_hash(p->b, p->white_to_move,
+        p->castle_wk | (p->castle_wq << 1) | (p->castle_bk << 2) | (p->castle_bq << 3));
+    if (ply > 0 && is_repetition(ph, 1)) return 0; // draw
+
+    Move moves[256];
+    int n = legal_moves(p, moves);
+
+    if (n == 0) {
+        if (in_check(p, p->white_to_move))
+            return maximizing ? -MATE_SCORE + ply : MATE_SCORE - ply;
+        return 0; // stalemate
+    }
+
+    // Null Move Pruning: skip our turn at reduced depth
+    if (do_null && depth >= 3 && !in_check(p, p->white_to_move)) {
+        Pos null_pos = *p;
+        null_pos.white_to_move = !null_pos.white_to_move;
+        int null_score = alpha_beta(&null_pos, depth - 1 - NULL_MOVE_R,
+                                    alpha, beta, ply + 1, 0);
+        if (maximizing && null_score >= beta) return beta;
+        if (!maximizing && null_score <= alpha) return alpha;
+    }
+
+    order_moves(p, moves, n, ply);
+
+    if (maximizing) {
+        int best = -INF_SCORE;
+        for (int i = 0; i < n; i++) {
+            int rdepth = depth - 1;
+            // LMR: reduce depth for late quiet moves
+            if (i >= 4 && depth >= 3 && p->b[moves[i].to] == '.' && !moves[i].promo)
+                rdepth--;
+
+            Pos next = make_move(p, moves[i]);
+            int score = alpha_beta(&next, rdepth, alpha, beta, ply + 1, 1);
+
+            // Re-search at full depth if LMR found something good
+            if (rdepth < depth - 1 && score > alpha)
+                score = alpha_beta(&next, depth - 1, alpha, beta, ply + 1, 1);
+
+            if (score > best) best = score;
+            if (score > alpha) alpha = score;
+            if (alpha >= beta) {
+                if (p->b[moves[i].to] == '.') {
+                    store_killer(moves[i], ply);
+                    history_table[moves[i].from][moves[i].to] += depth * depth;
+                }
+                break;
+            }
+        }
+        return best;
+    } else {
+        int best = INF_SCORE;
+        for (int i = 0; i < n; i++) {
+            int rdepth = depth - 1;
+            if (i >= 4 && depth >= 3 && p->b[moves[i].to] == '.' && !moves[i].promo)
+                rdepth--;
+
+            Pos next = make_move(p, moves[i]);
+            int score = alpha_beta(&next, rdepth, alpha, beta, ply + 1, 1);
+
+            if (rdepth < depth - 1 && score < beta)
+                score = alpha_beta(&next, depth - 1, alpha, beta, ply + 1, 1);
+
+            if (score < best) best = score;
+            if (score < beta) beta = score;
+            if (alpha >= beta) {
+                if (p->b[moves[i].to] == '.') {
+                    store_killer(moves[i], ply);
+                    history_table[moves[i].from][moves[i].to] += depth * depth;
+                }
+                break;
+            }
+        }
+        return best;
+    }
+}
+
+/**
+ * Iterative Deepening: search depth 1, then 2, ... up to DEFAULT_DEPTH.
+ * Best move from previous depth improves ordering at the next depth.
+ */
+static Move find_best_move(Pos *p, Move *moves, int num_moves) {
+    // Clear killer and history tables
+    memset(killers, 0, sizeof(killers));
+    memset(history_table, 0, sizeof(history_table));
+
+    Move best_move = moves[0];
+
+    for (int depth = 1; depth <= DEFAULT_DEPTH; depth++) {
+        order_moves(p, moves, num_moves, 0);
+
+        // Put previous iteration's best move first
+        if (depth > 1) {
+            for (int i = 1; i < num_moves; i++) {
+                if (moves[i].from == best_move.from && moves[i].to == best_move.to
+                    && moves[i].promo == best_move.promo) {
+                    Move tmp = moves[0]; moves[0] = moves[i]; moves[i] = tmp;
+                    break;
+                }
+            }
+        }
+
+        int alpha = -INF_SCORE, beta = INF_SCORE;
+        int best_idx = 0;
+
+        if (p->white_to_move) {
+            int best_score = -INF_SCORE;
+            for (int i = 0; i < num_moves; i++) {
+                Pos next = make_move(p, moves[i]);
+
+                // Penalize moves that repeat a known position
+                unsigned long long next_hash = compute_pos_hash(next.b, next.white_to_move,
+                    next.castle_wk | (next.castle_wq << 1) | (next.castle_bk << 2) | (next.castle_bq << 3));
+                if (is_repetition(next_hash, 1)) {
+                    // Treat as slightly worse than a draw to break loops
+                    int score = -10;
+                    if (score > best_score) { best_score = score; best_idx = i; }
+                    continue;
+                }
+
+                int score = alpha_beta(&next, depth - 1, alpha, beta, 1, 1);
+                if (score > best_score) { best_score = score; best_idx = i; }
+                if (score > alpha) alpha = score;
+            }
+        } else {
+            int best_score = INF_SCORE;
+            for (int i = 0; i < num_moves; i++) {
+                Pos next = make_move(p, moves[i]);
+
+                unsigned long long next_hash = compute_pos_hash(next.b, next.white_to_move,
+                    next.castle_wk | (next.castle_wq << 1) | (next.castle_bk << 2) | (next.castle_bq << 3));
+                if (is_repetition(next_hash, 1)) {
+                    int score = 10;
+                    if (score < best_score) { best_score = score; best_idx = i; }
+                    continue;
+                }
+
+                int score = alpha_beta(&next, depth - 1, alpha, beta, 1, 1);
+                if (score < best_score) { best_score = score; best_idx = i; }
+                if (score < beta) beta = score;
+            }
+        }
+
+        best_move = moves[best_idx];
+    }
+
+    return best_move;
+}
+
+
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdin, NULL, _IONBF, 0);
+    srand(time(NULL));
+
     Pos pos;
     pos_start(&pos);
 
-    char line[1024];
+    char line[8192];
     while (fgets(line, sizeof(line), stdin)) {
         // trim
         size_t len = strlen(line);
@@ -511,7 +1072,7 @@ int main(void) {
         if (!len) continue;
 
         if (strcmp(line, "uci") == 0) {
-            printf("id name team_c\n");
+            printf("id name team_c %s\n", ENGINE_VERSION);
             printf("id author team_c_bryan\n");
             printf("uciok\n");
             fflush(stdout);
@@ -520,16 +1081,33 @@ int main(void) {
             fflush(stdout);
         } else if (strcmp(line, "ucinewgame") == 0) {
             pos_start(&pos);
+            g_move_count = 0;
+            g_pos_hash_count = 0; // Reset position history for new game
         } else if (strncmp(line, "position", 8) == 0) {
             parse_position(&pos, line);
         } else if (strncmp(line, "go", 2) == 0) {
-            Move ms[256];
-            int n = legal_moves(&pos, ms);
-            if (n <= 0) {
-                printf("bestmove 0000\n");
+            // Check opening book first
+            char book_move[8];
+            if (book_lookup(book_move)) {
+                // Track book move position for repetition detection
+                Pos book_pos = pos;
+                apply_uci_move(&book_pos, book_move);
+                if (g_pos_hash_count < 1024) {
+                    g_pos_hashes[g_pos_hash_count++] = compute_pos_hash(book_pos.b, book_pos.white_to_move,
+                        book_pos.castle_wk | (book_pos.castle_wq << 1) | (book_pos.castle_bk << 2) | (book_pos.castle_bq << 3));
+                }
+                printf("bestmove %s\n", book_move);
                 fflush(stdout);
             } else {
-                print_bestmove(ms[0]);
+                Move ms[256];
+                int n = legal_moves(&pos, ms);
+                if (n <= 0) {
+                    printf("bestmove 0000\n");
+                    fflush(stdout);
+                } else {
+                    Move best_calculated_move = find_best_move(&pos, ms, n);
+                    print_bestmove(best_calculated_move);
+                }
             }
         } else if (strcmp(line, "quit") == 0) {
             break;
