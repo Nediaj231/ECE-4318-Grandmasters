@@ -1,13 +1,25 @@
 # ECE-4318-codes
-Jaiden's first commit
 
-Jaiden Phung
-2/24/2026
+Team 1 Chess Grandmasters  
+Language: C
 
-Jan's first commit
+Members: Jaiden, Jan, Cole, Charlie, Yen
 
-Cole's first commit
+Supported Chess Rules:  
+- Standard piece movement  
+- Legal move validation (no illegal/self-check moves)  
+- Check and checkmate detection  
+- Stalemate detection  
+- Castling (king-side and queen-side)  
+- Pawn promotion (Q, R, B, N)  
+- Repetition detection (basic draw handling)
 
-Charlie's commit
-
-Yen's commit
+Engine Features:  
+- Alpha-Beta Pruning  
+- Iterative Deepening  
+- Quiescence Search  
+- Move Ordering  
+- Killer Move Heuristic  
+- History Heuristic  
+- Null Move Pruning  
+- Opening Book  
